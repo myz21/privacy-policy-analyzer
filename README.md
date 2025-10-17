@@ -1,7 +1,7 @@
 # Privacy Policy Analyzer
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10.11+](https://img.shields.io/badge/python-3.10.11+-blue.svg)](https://www.python.org/downloads/)
 [![GitHub stars](https://img.shields.io/github/stars/HappyHackingSpace/privacy-policy-analyzer.svg)](
   https://github.com/HappyHackingSpace/privacy-policy-analyzer/stargazers
 )
@@ -55,7 +55,7 @@ privacy-policy-analyzer/
 
 ## Requirements
 
-- Python **3.13+**
+- Python **3.10.11 or higher**
 - An **OpenAI API key**
 - (Optional) **Chrome/Chromium** on the machine (Selenium fallback; driver auto-installs)
 
