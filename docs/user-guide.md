@@ -18,7 +18,7 @@ This guide explains how to install, run, and interpret results from **Privacy Po
 
 ### Prerequisites
 
-- Python 3.13+  
+- Python 3.10.11 or higher
 - An OpenAI API key available in your environment (or `.env`)  
 - Google Chrome (required only if you plan to use Selenium fallback)  
 - Optional: `trafilatura` for enhanced extraction

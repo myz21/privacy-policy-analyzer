@@ -17,7 +17,7 @@ provides guidelines and information for contributors.
 
 ### Prerequisites
 
-- Python 3.13 or higher
+- Python 3.10.11 or higher
 - Git
 - uv (recommended) or pip
 - OpenAI API key (for testing)
