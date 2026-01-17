@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import sys
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,6 +39,19 @@ except Exception:
 
 
 load_dotenv()
+
+# Priority-based regex patterns for discovery (Lower index = Higher priority)
+_PRIVACY_REGEX_PATTERNS = [
+    re.compile(r"privacy-policy\b", re.IGNORECASE),          # 1. Target: Full legal text
+    re.compile(r"\bprivacy/policy\b", re.IGNORECASE),        # 2
+    re.compile(r"privacy-policy-[a-z]+", re.IGNORECASE),    # 3
+    re.compile(r"\bdata-protection\b", re.IGNORECASE),       # 4
+    re.compile(r"\bsecurity-policy\b", re.IGNORECASE),       # 5
+    re.compile(r"\blegal-notice\b", re.IGNORECASE),          # 6
+    re.compile(r"\bprivacy\b", re.IGNORECASE),               # 7. Target: Menu/Hub page
+    re.compile(r"\blegal\b", re.IGNORECASE),                 # 8
+    re.compile(r"\bterms\b", re.IGNORECASE),                 # 9
+]
 
 _PRIVACY_CUES = (
     "privacy",
@@ -131,6 +145,7 @@ def _head_ok(url: str, timeout: int = 8) -> bool:
 
 
 def _extract_text_http(url: str) -> Optional[str]:
+    """Fetch text from <main> tag, fallback to <body>."""
     if _HAS_TRAFILATURA:
         try:
             downloaded = trafilatura.fetch_url(url)
@@ -143,9 +158,15 @@ def _extract_text_http(url: str) -> Optional[str]:
     r = _http_get(url)
     if not r:
         return None
+    
     soup = BeautifulSoup(r.text, "html.parser")
-    body = soup.find("body")
-    t = body.get_text("\n").strip() if body else ""
+    
+    # Extraction Logic: Prefer <main>, fallback to <body>
+    content_element = soup.find("main")
+    if not content_element or not content_element.get_text(strip=True):
+        content_element = soup.find("body")
+        
+    t = content_element.get_text("\n").strip() if content_element else ""
     return t if len(t) >= 400 else None
 
 
@@ -168,6 +189,16 @@ def fetch_content_with_selenium(url: str) -> Optional[str]:
         WebDriverWait(driver, 12).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
+        
+        # Selenium Extraction: Prefer <main>, fallback to <body>
+        try:
+            content_element = driver.find_element(By.TAG_NAME, "main")
+            text = content_element.get_attribute("innerText")
+            if text and len(text.strip()) > 100:
+                return text
+        except Exception:
+            pass
+            
         return driver.find_element(By.TAG_NAME, "body").get_attribute("innerText")
     except Exception:
         return None
@@ -259,55 +290,101 @@ def _fetch_sitemap_urls(url: str, max_urls: int = 50) -> List[str]:
     return uniq
 
 
-def _discover_candidates_from_html(start_url: str) -> List[str]:
-    """Collect privacy-like links from the HTML of the given page."""
-    r = _http_get(start_url)
-    if not r:
-        return []
-    soup = BeautifulSoup(r.text, "html.parser")
-    links: List[str] = []
+def _get_url_priority(url: str) -> int:
+    """Return the priority index of a URL based on regex patterns. Lower is better."""
+    for idx, pattern in enumerate(_PRIVACY_REGEX_PATTERNS):
+        if pattern.search(url):
+            return idx
+    return 999
+
+
+def find_best_policy_url(html_content: str, base_url: str) -> Optional[Tuple[str, int]]:
+    """
+    Finds the single best-matching URL for a privacy-related link on the page.
+    Returns (url, priority_index).
+    """
+    if not html_content:
+        return None
+        
+    soup = BeautifulSoup(html_content, "html.parser")
+    
+    # Store tuples of (priority_index, full_url)
+    matches: List[Tuple[int, str]] = []
+    seen_urls = set()
+
     for a in soup.find_all("a", href=True):
-        text = (a.get_text(" ") or "") + " " + a["href"]  # type: ignore[operator, index]
-        if _is_privacy_like(text):
-            links.append(urljoin(r.url, a["href"]))  # type: ignore[index]
-    seen, uniq = set(), []
-    for u in links:
-        if u not in seen:
-            seen.add(u)
-            uniq.append(u)
-    return uniq
-
-
-def _extract_text_quality(url: str) -> Tuple[Optional[str], Optional[str]]:
-    """Extract and sanity-check text content for policy-ness."""
-    if _HAS_TRAFILATURA:
+        href = a["href"]
         try:
-            downloaded = trafilatura.fetch_url(url)
-            if not downloaded:
-                return None, None
-            text = trafilatura.extract(downloaded, include_formatting=False) or ""
-            t = text.strip()
-            if len(t) >= 500 and _is_privacy_like(t[:2000]):
-                return t, url
-            return None, url
+            full_url = urljoin(base_url, href)
         except Exception:
-            return None, None
-    r = _http_get(url)
+            continue
+
+        if not full_url.startswith("http"):
+            continue
+            
+        if full_url in seen_urls:
+            continue
+        seen_urls.add(full_url)
+
+        # Check regex priority
+        p = _get_url_priority(full_url)
+        if p < 999:
+            matches.append((p, full_url))
+
+    if not matches:
+        return None
+
+    # Sort by priority index (ascending), get the best match
+    matches.sort(key=lambda x: x[0])
+    return (matches[0][1], matches[0][0])
+
+
+def _improve_candidate(candidate_url: str) -> str:
+    """
+    If the found candidate is a generic 'hub' page (e.g. /privacy),
+    fetch it and check if it links to a more specific policy (e.g. /privacy-policy).
+    """
+    # 0=privacy-policy, 1=privacy/policy, 2=privacy-policy-x
+    # Generally, if we found something better than generic 'privacy' (index 6), we stick with it.
+    # But let's say anything > 2 is worth checking deeper.
+    priority = _get_url_priority(candidate_url)
+    if priority <= 2:
+        return candidate_url
+
+    print(f"DEBUG: Candidate '{candidate_url}' is generic (Priority {priority}). Checking for deep links...")
+    r = _http_get(candidate_url)
     if not r:
-        return None, None
-    soup = BeautifulSoup(r.text, "html.parser")
-    body = soup.find("body")
-    t = (body.get_text("\n").strip() if body else "")[:4000]
-    if len(t) >= 500 and _is_privacy_like(t):
-        return t, r.url
-    return None, r.url
+        return candidate_url
+
+    match_info = find_best_policy_url(r.text, r.url)
+    if match_info:
+        deep_url, deep_priority = match_info
+        if deep_priority < priority:
+            print(f"DEBUG: Upgraded to deep link '{deep_url}' (Priority {deep_priority})")
+            return deep_url
+    
+    return candidate_url
 
 
 def resolve_privacy_url(input_url: str) -> Tuple[str, Optional[str]]:
-    """Resolve a likely privacy policy URL starting from any given page."""
+    """Resolve a likely privacy policy URL using heuristic discovery."""
+    # If input looks like privacy policy already
     if _is_privacy_like(input_url):
         return input_url, None
 
+    # Fetch the input page to look for links
+    r = _http_get(input_url)
+    if r:
+        match_info = find_best_policy_url(r.text, r.url)
+        if match_info:
+            best_match, _ = match_info
+            # Validate content
+            text = _extract_text_http(best_match)
+            if text:
+                final_url = _improve_candidate(best_match)
+                return final_url, input_url
+
+    # Fallback 1: Common paths
     parsed = urlparse(input_url)
     base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
 
@@ -316,23 +393,149 @@ def resolve_privacy_url(input_url: str) -> Tuple[str, Optional[str]]:
         cand = base + p
         if _head_ok(cand) or _light_verify(cand):
             if _light_verify(cand):
-                return cand, input_url
+                final_url = _improve_candidate(cand)
+                return final_url, input_url
             path_heads.append(cand)
 
     for cand in path_heads:
         if _light_verify(cand):
-            return cand, input_url
+            final_url = _improve_candidate(cand)
+            return final_url, input_url
 
     for sm in _get_sitemaps_from_robots(base):
         for cand in _fetch_sitemap_urls(sm, max_urls=50):
             if _light_verify(cand):
+                # We typically don't improve sitemap candidates as they are usually leaf nodes
                 return cand, input_url
 
-    for cand in _discover_candidates_from_html(input_url):
-        text, _ = _extract_text_quality(cand)
-        if text:
-            return cand, input_url
+    return input_url, None
 
+
+def _collect_link_candidates(html_content: str, base_url: str, limit: int = 100) -> List[Tuple[str, str]]:
+    """
+    Collect all privacy-related link candidates from HTML.
+    Returns list of (full_url, anchor_text) tuples, de-duplicated.
+    """
+    if not html_content:
+        return []
+    
+    soup = BeautifulSoup(html_content, "html.parser")
+    candidates: Dict[str, str] = {}  # url -> best_anchor_text
+    
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        try:
+            full_url = urljoin(base_url, href)
+        except Exception:
+            continue
+        
+        if not full_url.startswith("http"):
+            continue
+        
+        # Get anchor text
+        anchor_text = (a.get_text(strip=True) or "").lower()
+        
+        # Skip if both URL and anchor text don't look privacy-related
+        if full_url not in candidates:
+            if _is_privacy_like(full_url) or _is_privacy_like(anchor_text):
+                candidates[full_url] = anchor_text
+        
+        if len(candidates) >= limit:
+            break
+    
+    return [(url, text) for url, text in candidates.items()]
+
+
+def _score_candidate(url: str, anchor_text: str = "") -> Tuple[int, int]:
+    """
+    Score a candidate URL and anchor text.
+    Returns (priority_index, anchor_bonus) where lower values are better.
+    anchor_bonus: -1 if anchor explicitly says "privacy policy", 0 otherwise.
+    """
+    url_priority = _get_url_priority(url)
+    anchor_bonus = 0
+    
+    # Give extra credit if anchor text explicitly mentions "privacy policy"
+    anchor_lower = (anchor_text or "").lower()
+    if "privacy policy" in anchor_lower or "privacy-policy" in anchor_lower:
+        anchor_bonus = -1  # Lower is better, so -1 boosts the score
+    
+    return (url_priority, anchor_bonus)
+
+
+def _pick_best_verified_candidate(candidates: List[Tuple[str, str]], max_verify: int = 5) -> Optional[str]:
+    """
+    Score candidates, verify top ones, return the best verified candidate.
+    """
+    if not candidates:
+        return None
+    
+    # Score all candidates
+    scored = [(url, text, _score_candidate(url, text)) for url, text in candidates]
+    # Sort by (priority, anchor_bonus), ascending
+    scored.sort(key=lambda x: (x[2][0], x[2][1]))
+    
+    # Verify top candidates (up to max_verify)
+    for i, (url, text, score) in enumerate(scored[:max_verify]):
+        if _light_verify(url):
+            print(f"DEBUG: Selected URL '{url}' from {len(candidates)} candidates (score: {score})")
+            return url
+    
+    return None
+
+
+def resolve_privacy_url(input_url: str) -> Tuple[str, Optional[str]]:
+    """
+    Resolve a likely privacy policy URL using link-based discovery (primary),
+    then sitemap discovery, then common paths (fallback).
+    """
+    # If input looks like privacy policy already
+    if _is_privacy_like(input_url):
+        return input_url, None
+    
+    parsed = urlparse(input_url)
+    base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    
+    # === PHASE 1: Link-based discovery ===
+    # Collect links from input page and homepage
+    candidates_set: Dict[str, str] = {}  # url -> anchor_text
+    
+    for page_url in [input_url, base]:
+        r = _http_get(page_url)
+        if r:
+            links = _collect_link_candidates(r.text, r.url, limit=100)
+            for url, text in links:
+                if url not in candidates_set:
+                    candidates_set[url] = text
+    
+    if candidates_set:
+        candidates_list = [(url, text) for url, text in candidates_set.items()]
+        best_url = _pick_best_verified_candidate(candidates_list, max_verify=5)
+        if best_url:
+            return best_url, input_url
+    
+    # === PHASE 2: Sitemap-based discovery ===
+    for sm in _get_sitemaps_from_robots(base):
+        for cand in _fetch_sitemap_urls(sm, max_urls=50):
+            if _light_verify(cand):
+                print(f"DEBUG: Found via sitemap: {cand}")
+                return cand, input_url
+    
+    # === PHASE 3: Common paths (last resort) ===
+    path_heads: List[str] = []
+    for p in _COMMON_PATHS:
+        cand = base + p
+        if _head_ok(cand) or _light_verify(cand):
+            if _light_verify(cand):
+                print(f"DEBUG: Found via common path: {cand}")
+                return cand, input_url
+            path_heads.append(cand)
+    
+    for cand in path_heads:
+        if _light_verify(cand):
+            print(f"DEBUG: Found via common path (verified): {cand}")
+            return cand, input_url
+    
     return input_url, None
 
 
@@ -351,9 +554,12 @@ def split_text_into_chunks(
 def analyze_chunk_json(text_chunk: str, model: str) -> Optional[Dict[str, Any]]:
     """Analyze a text chunk with the LLM and return one JSON object."""
     api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set. Configure your .env file.")
-    client = OpenAI(api_key=api_key)
+    #client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url=base_url)
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -361,7 +567,7 @@ def analyze_chunk_json(text_chunk: str, model: str) -> Optional[Dict[str, Any]]:
             {"role": "user", "content": build_user_prompt(text_chunk)},
         ],
         temperature=0,
-        max_tokens=600,
+        max_tokens=2000, #changed from 300 to 2000
         response_format={"type": "json_object"},
     )
     content = (resp.choices[0].message.content or "").strip()
