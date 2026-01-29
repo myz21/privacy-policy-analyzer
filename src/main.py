@@ -1,3 +1,4 @@
+import time
 import argparse
 import gzip
 import io
@@ -98,7 +99,7 @@ def _is_privacy_like(s: str) -> bool:
     return any(k in s for k in _PRIVACY_CUES)
 
 
-def _http_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
+def _http_get(url: str, timeout: int = 5) -> Optional[requests.Response]:
     """HTTP GET with basic headers and redirects allowed."""
     try:
         r = requests.get(
@@ -116,13 +117,13 @@ def _http_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
         return None
 
 
-def _fetch_text(url: str, timeout: int = 12) -> Optional[str]:
+def _fetch_text(url: str, timeout: int = 5) -> Optional[str]:
     """Fetch raw text content via GET."""
     r = _http_get(url, timeout=timeout)
     return r.text if r else None
 
 
-def _head_ok(url: str, timeout: int = 8) -> bool:
+def _head_ok(url: str, timeout: int = 3) -> bool:
     """Lightweight existence probe using HEAD; redirects considered OK."""
     try:
         r = requests.head(
@@ -183,10 +184,13 @@ def fetch_content_with_selenium(url: str) -> Optional[str]:
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
     )
+    opts.add_argument("--blink-settings=imagesEnabled=false") # do not load images
+    opts.page_load_strategy = 'eager'  # do not wait for full load
     driver = webdriver.Chrome(options=opts)
     try:
+        driver.set_page_load_timeout(10)
         driver.get(url)
-        WebDriverWait(driver, 12).until(
+        WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
         
@@ -219,11 +223,7 @@ def fetch_policy_text(url: str, prefer: str = "auto") -> Optional[str]:
 
 def _light_verify(url: str) -> bool:
     """Low-cost check that a URL likely points to a privacy policy page."""
-    t = _extract_text_http(url)
-    if not t:
-        return False
-    low = t[:3000].lower()
-    return any(k in low for k in _PRIVACY_CUES) and len(t) >= 500
+    return _head_ok(url, timeout=3) #only check for existence
 
 
 def _get_sitemaps_from_robots(base_url: str) -> List[str]:
@@ -435,11 +435,21 @@ def _collect_link_candidates(html_content: str, base_url: str, limit: int = 100)
         # Get anchor text
         anchor_text = (a.get_text(strip=True) or "").lower()
         
-        # Skip if both URL and anchor text don't look privacy-related
-        if full_url not in candidates:
-            if _is_privacy_like(full_url) or _is_privacy_like(anchor_text):
+        #select candidates based on privacy-likeness or priority instead of just any link
+        url_priority = _get_url_priority(full_url)
+        anchor_priority = _get_url_priority(anchor_text)
+        if (
+            _is_privacy_like(full_url)
+            or _is_privacy_like(anchor_text)
+            or url_priority < 999
+            or anchor_priority < 999
+        ):
+            existing = candidates.get(full_url, "")
+            if (
+                not existing
+                or ("privacy policy" in anchor_text and "privacy policy" not in existing)
+            ):
                 candidates[full_url] = anchor_text
-        
         if len(candidates) >= limit:
             break
     
@@ -477,6 +487,9 @@ def _pick_best_verified_candidate(candidates: List[Tuple[str, str]], max_verify:
     
     # Verify top candidates (up to max_verify)
     for i, (url, text, score) in enumerate(scored[:max_verify]):
+        #if the score is already very good, skip verification
+        if score[0] <= 1: 
+            return url
         if _light_verify(url):
             print(f"DEBUG: Selected URL '{url}' from {len(candidates)} candidates (score: {score})")
             return url
@@ -589,7 +602,7 @@ def main() -> None:
         help="OpenAI chat model, e.g., gpt-4o",
     )
     parser.add_argument(
-        "--chunk-size", type=int, default=3500, help="Character-based chunk size"
+        "--chunk-size", type=int, default=10000, help="Character-based chunk size"
     )
     parser.add_argument(
         "--chunk-overlap", type=int, default=350, help="Overlap between chunks"
@@ -623,11 +636,23 @@ def main() -> None:
     args = parser.parse_args()
     input_url = args.url or input("Enter a site (or privacy policy) URL: ").strip()
 
+    start_total = time.time()
+    
+    print(f"\n[1/3] Resolving Privacy URL...")
+    start_discovery = time.time()
+    
     resolved_url, _ = (
         (input_url, None) if args.no_discover else resolve_privacy_url(input_url)
     )
-
+    discovery_time = time.time() - start_discovery
+    print(f"DEBUG: Discovery took {discovery_time:.2f}s. Resolved to: {resolved_url}")
+    
+    print(f"[2/3] Fetching Policy Content...")
+    start_fetch = time.time()
     content = fetch_policy_text(resolved_url, prefer=args.fetch)
+    fetch_time = time.time() - start_fetch
+    print(f"DEBUG: Fetching took {fetch_time:.2f}s. Content length: {len(content) if content else 0} chars.")
+    
     if not content:
         print(
             json.dumps(
@@ -662,14 +687,24 @@ def main() -> None:
         tail = " ".join(chunks[args.max_chunks - 1 :])
         chunks = head + [tail]
 
+    start_analysis = time.time()
     results: List[Dict[str, Any]] = []
-    for i, chunk in enumerate(chunks, 1):
-        print(f"Analyzing chunk {i}/{len(chunks)}...")
-        j = analyze_chunk_json(chunk, model=args.model)
-        if isinstance(j, dict) and "scores" in j:
-            j["index"] = i
-            results.append(j)
+    print(f"[3/3]Analyzing {len(chunks)} chunks in parallel...")
+    
+    # Parallel analysis of chunks
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(analyze_chunk_json, chunk, args.model): i for i, chunk in enumerate(chunks, 1)}
+        for future in futures:
+            idx = futures[future]
+            res = future.result()
+            if res:
+                res["index"] = idx
+                results.append(res)
 
+    analysis_time = time.time() - start_analysis
+    total_time = time.time() - start_total
+    
     if not results:
         print(
             json.dumps(
@@ -708,7 +743,16 @@ def main() -> None:
         out = {**base, **agg, "chunks": results}
 
     print(json.dumps(out, ensure_ascii=False, indent=2))
-
+    print("\n" + "="*40)
+    print(f"Performance Summary for model:")
+    print("-" * 40)
+    print(f"Discovery time:    {discovery_time:>6.2f}s")
+    print(f"Fetching time:   {fetch_time:>6.2f}s")
+    print(f"LLM Analysis time:          {analysis_time:>6.2f}s")
+    print(f"Total time :          {total_time:>6.2f}s")
+    if chunks:
+        print(f"Average time needed per chunk:    {(analysis_time/len(chunks)):>6.2f}s")
+    print("="*40 + "\n")
 
 if __name__ == "__main__":
     main()
