@@ -530,8 +530,14 @@ def _score_candidate(url: str, anchor_text: str = "") -> tuple[int, int]:
 
 
 def _pick_best_verified_candidate(candidates: list[tuple[str, str]], max_verify: int = 5) -> str | None:
-    """
-    Score candidates, verify top ones, return the best verified candidate.
+    """Score candidates, verify top ones, and return the best verified candidate URL.
+
+    Args:
+        candidates: A list of (url, anchor_text) candidates.
+        max_verify: Maximum number of candidates to verify. Defaults to 5.
+
+    Returns:
+        The best verified privacy policy URL, or None if no candidate is verified.
     """
     if not candidates:
         return None
@@ -543,20 +549,24 @@ def _pick_best_verified_candidate(candidates: list[tuple[str, str]], max_verify:
     
     # Verify top candidates (up to max_verify)
     for i, (url, text, score) in enumerate(scored[:max_verify]):
-        #if the score is already very good, skip verification
+        # if the score is already very good, skip verification
         if score[0] <= 1: 
             return url
         if _light_verify(url):
-            print(f"DEBUG: Selected URL '{url}' from {len(candidates)} candidates (score: {score})")
+            click.secho(f"      DEBUG: Selected URL '{url}' from {len(candidates)} candidates (score: {score})", fg="yellow", dim=True, err=True)
             return url
     
     return None
 
 
 def resolve_privacy_url(input_url: str) -> tuple[str, str | None]:
-    """
-    Resolve a likely privacy policy URL using link-based discovery (primary),
-    then sitemap discovery, then common paths (fallback).
+    """Resolve a likely privacy policy URL using link-based discovery, sitemaps, or common paths.
+
+    Args:
+        input_url: The initial URL provided to find a privacy policy for.
+
+    Returns:
+        A tuple of (resolved_url, original_input_url).
     """
     # If input looks like privacy policy already
     if _is_privacy_like(input_url):
@@ -586,13 +596,13 @@ def resolve_privacy_url(input_url: str) -> tuple[str, str | None]:
     for sm in _get_sitemaps_from_robots(base):
         for cand in _fetch_sitemap_urls(sm, max_urls=50):
             if _light_verify(cand):
-                print(f"DEBUG: Found via sitemap: {cand}")
+                click.secho(f"      DEBUG: Found via sitemap: {cand}", fg="yellow", dim=True, err=True)
                 return cand, input_url
     
     # === PHASE 3: Common paths (last resort) ===
     for candidate_url in (base + path for path in _COMMON_PATHS):
         if _light_verify(candidate_url):
-            print(f"DEBUG: Found via common path: {candidate_url}")
+            click.secho(f"      DEBUG: Found via common path: {candidate_url}", fg="yellow", dim=True, err=True)
             return candidate_url, input_url
 
     return input_url, None
@@ -601,7 +611,16 @@ def resolve_privacy_url(input_url: str) -> tuple[str, str | None]:
 def split_text_into_chunks(
     text: str, chunk_size: int = 3500, chunk_overlap: int = 350
 ) -> list[str]:
-    """Split text into chunks using paragraph-first recursive boundaries."""
+    """Split text into chunks using paragraph-first recursive boundaries.
+
+    Args:
+        text: The text to split.
+        chunk_size: Target size of each chunk in characters. Defaults to 3500.
+        chunk_overlap: Overlap between adjacent chunks in characters. Defaults to 350.
+
+    Returns:
+        A list of split text chunks.
+    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
