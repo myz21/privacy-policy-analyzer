@@ -62,6 +62,10 @@ sequenceDiagram
     CLI->>User: Renders requested report (summary | detailed | full)
 ```
 
+## System Workflow Diagram
+
+![Privacy Policy Analyzer System Workflow](docs/workflow.svg)
+
 ## Features
 
 - **Multi-LLM Provider Engine**: Seamlessly switch between **Google Gemini** (using official `google-genai` SDK) and **OpenAI GPT** models based on model name prefix.
