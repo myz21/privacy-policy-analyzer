@@ -20,6 +20,7 @@ dependencies = [
     "chromedriver-autoinstaller>=0.6.4",
     "requests>=2.32.5",
     "click>=8.1.0",
+    "google-genai>=1.0.0",
 ]
 
 [dependency-groups]
