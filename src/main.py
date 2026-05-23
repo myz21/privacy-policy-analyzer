@@ -19,6 +19,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from google import genai
 from google.genai import types as genai_types
 from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -629,6 +630,11 @@ def split_text_into_chunks(
     return splitter.split_text(text or "")
 
 
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_random_exponential(min=2, max=30),
+    reraise=True
+)
 def _analyze_chunk_gemini(text_chunk: str, model: str) -> dict[str, Any] | None:
     """Analyze a text chunk using the Google Gemini API.
 
@@ -664,6 +670,11 @@ def _analyze_chunk_gemini(text_chunk: str, model: str) -> dict[str, Any] | None:
         return None
 
 
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_random_exponential(min=2, max=30),
+    reraise=True
+)
 def _analyze_chunk_openai(text_chunk: str, model: str) -> dict[str, Any] | None:
     """Analyze a text chunk with the OpenAI API and return one JSON object.
 
